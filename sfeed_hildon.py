@@ -249,6 +249,99 @@ def article_text(item):
     return "\n\n".join(parts)
 
 
+# ---- settings and the update in the background -----------------------------------------------------------------------------------------------
+
+CONF = os.path.join(DIR, "hildon.conf")
+LAST = os.path.join(DIR, "hildon.last")            # its modification time: when the feeds were updated the last time
+PIDFILE = os.path.join(DIR, "update.pid")          # the sfeed_update that runs now (started by the GUI or by cron)
+INTERVALS = [("Off", 0), ("Every hour", 60), ("Every 3 hours", 180), ("Every 6 hours", 360), ("Every 12 hours", 720), ("Every 24 hours", 1440)]
+
+
+def load_conf():
+    conf = {"background_minutes": "0"}
+    try:
+        for ln in open(CONF, encoding="utf-8"):
+            k, sep, v = ln.partition("=")
+            if sep and k.strip() in conf:
+                conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def background_minutes():
+    try:
+        return max(0, int(load_conf()["background_minutes"]))
+    except ValueError:
+        return 0
+
+
+def set_background_minutes(minutes):
+    os.makedirs(DIR, exist_ok=True)
+    with open(CONF, "w", encoding="utf-8") as f:
+        f.write("# sfeed-hildon: how often cron (every 30 minutes, when the phone is online already) updates the feeds; 0 = never\nbackground_minutes=%d\n" % int(minutes))
+
+
+def last_update():
+    try:
+        return os.stat(LAST).st_mtime
+    except OSError:
+        return 0
+
+
+def touch_last():
+    os.makedirs(DIR, exist_ok=True)
+    with open(LAST, "a"):
+        pass
+    os.utime(LAST, None)
+
+
+def running_update():
+    """True while a sfeed_update started by this program runs (the pid file names it; a stale file is ignored)."""
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        return "sfeed_update" in open("/proc/%d/cmdline" % pid, "rb").read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return False
+
+
+def online():
+    """True when a default route exists (a connection is up); does not touch the connection manager."""
+    try:
+        with open("/proc/net/route") as f:
+            return any(ln.split()[1:2] == ["00000000"] for ln in f.read().splitlines()[1:])
+    except OSError:
+        return False
+
+
+def cron_run(now=None, is_online=online, run=None):
+    """What cron starts (every 30 minutes): update the feeds when the background update is on, its interval has elapsed, a connection is up and
+    no update runs. Returns the reason in a word (for tests and the log)."""
+    minutes = background_minutes()
+    if not minutes:
+        return "off"
+    now = time.time() if now is None else now
+    if now - last_update() < minutes * 60:
+        return "not due"
+    if running_update():
+        return "running"
+    if not is_online():
+        return "offline"
+    if run is None:
+        p = start_update()
+        try:
+            p.wait(timeout=900)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return "timeout"
+        ok = p.returncode == 0
+    else:
+        ok = run()
+    if ok:
+        touch_last()
+    return "updated" if ok else "failed"
+
+
 # ---- fetching and the browser ---------------------------------------------------------------------------------------------------------------
 
 def update_command():
@@ -260,7 +353,10 @@ def start_update():
     ensure_rc()
     os.makedirs(FEEDS, exist_ok=True)
     env = dict(os.environ, PATH=BIN + ":" + os.environ.get("PATH", ""), HOME=os.environ.get("HOME", "/home/user"))
-    return subprocess.Popen(update_command(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    p = subprocess.Popen(update_command(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    with open(PIDFILE, "w") as f:
+        f.write(str(p.pid))
+    return p
 
 
 def _session_bus():

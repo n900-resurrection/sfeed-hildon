@@ -100,6 +100,22 @@ ok("<h2>Middle</h2>" in pg and "<b>bold</b>" in pg and "https://example.org/2" i
 pg = open(S.write_page(items[0])).read()
 ok("a.mp3" in pg and "<pre" in pg, "a plain text item is shown preformatted, with the audio link")
 
+# --- background update (cron) ---
+S.LAST = os.path.join(tmp, "hildon.last")
+ran = []
+ok(S.background_minutes() == 0 and S.cron_run(is_online=lambda: True, run=lambda: ran.append(1) or True) == "off" and not ran, "background update is off by default: cron does nothing")
+S.set_background_minutes(180)
+ok(S.background_minutes() == 180, "the interval is stored")
+ok(S.cron_run(is_online=lambda: False, run=lambda: True) == "offline", "no connection: nothing")
+ok(S.cron_run(is_online=lambda: True, run=lambda: ran.append(1) or True) == "updated" and ran == [1], "due and online: the feeds are updated")
+ok(S.cron_run(is_online=lambda: True, run=lambda: ran.append(1) or True) == "not due" and ran == [1], "the interval has not elapsed: nothing")
+ok(S.cron_run(now=time.time() + 181 * 60, is_online=lambda: True, run=lambda: ran.append(1) or True) == "updated" and ran == [1, 1], "after the interval: updated again")
+os.utime(S.LAST, (0, 0))
+ok(S.cron_run(is_online=lambda: True, run=lambda: False) == "failed" and S.last_update() == 0, "a failed update does not move the time of the last update")
+open(S.PIDFILE, "w").write(str(os.getpid()))
+ok(not S.running_update(), "a pid file of a process that is not sfeed_update is ignored")
+S.set_background_minutes(0)
+
 # --- rc creation and update command ---
 os.remove(S.RC)
 S.ensure_rc()

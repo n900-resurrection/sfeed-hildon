@@ -5,6 +5,10 @@ remembers what was read (the same file as sfeed_markread) and edits the list of 
 import ctypes, faulthandler, gettext, os, re, sys
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
+if sys.argv[1:] == ["--cron"]:             # started by cron every 30 minutes: no GUI, nothing unless the background update is due
+    import sfeed_hildon as _F
+    print(_F.cron_run())
+    sys.exit(0)
 try:
     import hildonlite as hl
 except ImportError:                       # in the repository: the copy of hildonlite next to this application
@@ -163,7 +167,7 @@ def main():
 
     # ---- fetching ----
     def start_update():
-        if proc:
+        if proc or F.running_update():
             hl.Banner(win, _("An update is running already"))
             return
         proc.append(F.start_update())
@@ -172,6 +176,8 @@ def main():
     def tick():
         if proc and proc[0].poll() is not None:
             code = proc.pop().returncode
+            if code == 0:
+                F.touch_last()
             hl.Banner(win, _("Feeds updated") if code == 0 else _("The update failed (code %d)") % code)
             reload_feeds()
             for f in list(refreshers):
@@ -233,6 +239,19 @@ def main():
         if added:
             start_update()
 
+    def background():
+        d = hl.Dialog(_("Update in the background"), win)
+        cur = F.background_minutes()
+        picker = hl.PickerButton(_("Update the feeds"), [_(t) for t, _m in F.INTERVALS], min(range(len(F.INTERVALS)), key=lambda i: abs(F.INTERVALS[i][1] - cur)))
+        d.body.add(picker)
+        d.body.add(hl.Label(_("A job of cron checks every 30 minutes, and only when the phone is online already (it never starts a connection)."), wrap=True, xalign=0.0))
+        d.add_button(_("Save"), hl.OK); d.add_button(_("Cancel"), hl.CANCEL)
+        d.show()
+        if d.run() == hl.OK:
+            F.set_background_minutes(F.INTERVALS[picker.get_active()][1])
+            hl.Banner(win, _("Saved"))
+        d.destroy()
+
     def remove_feed():
         name = selected_feed()
         if not name or name == ALL:
@@ -254,6 +273,7 @@ def main():
     win.add(root)
     menu = hl.AppMenu()
     menu.add(_("Import feeds from OPML"), lambda b: import_opml())
+    menu.add(_("Update in the background"), lambda b: background())
     menu.add(_("Remove the selected feed"), lambda b: remove_feed())
     menu.add(_("Mark everything read"), lambda b: mark_all())
     menu.add(_("Quit"), lambda b: hl.quit())
