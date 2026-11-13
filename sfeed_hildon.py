@@ -394,6 +394,15 @@ def open_in_browser(url):
 PAGES = os.path.join(DIR, "pages")
 
 
+def tidy_html(content):
+    """Less empty space in a page: empty paragraphs and runs of <br> (feeds are full of them) are dropped."""
+    content = re.sub(r"<p\b[^>]*>(?:\s|&nbsp;|&#160;|<br\s*/?>)*</p>", "", content, flags=re.I)
+    return re.sub(r"(?:<br\s*/?>\s*){2,}", "<br>", content, flags=re.I)
+
+
+PAGE_CSS = "body{margin:.5em;line-height:1.3}p{margin:.4em 0}ul,ol{margin:.4em 0}h1,h2,h3{margin:.6em 0 .3em}pre{margin:.4em 0}img{max-width:100%;height:auto}"
+
+
 def write_page(item):
     """A small HTML page of an item in ~/.sfeed/pages (for the browser: pictures, links, kinetic scrolling); returns its path."""
     os.makedirs(PAGES, exist_ok=True)
@@ -403,12 +412,12 @@ def write_page(item):
         except OSError:
             pass
     name = "%d-%d.html" % (int(time.time()), abs(hash(item["link"])) % 100000)
-    body = item["content"] if item["ctype"] == "html" else "<pre style='white-space:pre-wrap'>%s</pre>" % html.escape(item["content"])
+    body = tidy_html(item["content"]) if item["ctype"] == "html" else "<pre style='white-space:pre-wrap'>%s</pre>" % html.escape(item["content"])
     meta = html.escape("  \u00b7  ".join(x for x in (when(item["ts"]) if item["ts"] else "", item["author"], item["feed"]) if x))
     enc = ("<p><a href='%s'>Audio/file</a></p>" % html.escape(item["enclosure"].split("|")[0], quote=True)) if item["enclosure"] else ""
-    page = ("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>%s</title></head><body>"
+    page = ("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>%s</title><style>%s</style></head><body>"
             "<h2>%s</h2><p><small>%s</small></p>%s%s<p><a href='%s'>Open the original page</a></p></body></html>"
-            % (html.escape(item["title"]), html.escape(item["title"]), meta, body, enc, html.escape(item["link"], quote=True)))
+            % (html.escape(item["title"]), PAGE_CSS, html.escape(item["title"]), meta, body, enc, html.escape(item["link"], quote=True)))
     path = os.path.join(PAGES, name)
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)

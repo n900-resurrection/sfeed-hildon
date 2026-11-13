@@ -100,6 +100,9 @@ ok("<h2>Middle</h2>" in pg and "<b>bold</b>" in pg and "https://example.org/2" i
 pg = open(S.write_page(items[0])).read()
 ok("a.mp3" in pg and "<pre" in pg, "a plain text item is shown preformatted, with the audio link")
 
+ok(S.tidy_html("<p>a</p><p>&nbsp;</p><p><br></p><p> </p>x<br><br>\n<br/>y") == "<p>a</p>x<br>y", "pages: empty paragraphs and runs of <br> are dropped")
+ok("margin" in S.PAGE_CSS and "<style>" in open(S.write_page(items[1])).read(), "pages: a style sheet with small margins")
+
 # --- background update (cron) ---
 S.LAST = os.path.join(tmp, "hildon.last")
 ran = []
