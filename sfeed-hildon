@@ -1,0 +1,277 @@
+#!/opt/python3/bin/python3
+"""sfeed-hildon: a native RSS/Atom reader for the N900 (Python 3 + hildonlite) on top of sfeed.
+The feeds are downloaded by sfeed_update (curl, TLS 1.3) into ~/.sfeed; this program lists the feeds, their items and the text of an item,
+remembers what was read (the same file as sfeed_markread) and edits the list of feeds in ~/.sfeed/sfeedrc."""
+import ctypes, faulthandler, gettext, os, re, sys
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+try:
+    import hildonlite as hl
+except ImportError:                       # in the repository: the copy of hildonlite next to this application
+    sys.path.insert(0, os.path.join(HERE, "..", "hildonlite"))
+    import hildonlite as hl
+import sfeed_hildon as F
+
+_ = gettext.gettext
+ALL = _("All unread")
+KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_PGUP, KEY_PGDN, KEY_SPACE = 0xff52, 0xff54, 0xff51, 0xff53, 0xff55, 0xff56, 0x20
+
+
+def scroll(area, pixels):
+    """Scroll a PannableArea by some pixels (negative: up), within its range."""
+    vp = ctypes.c_void_p
+    adj = hl._fn("hil", "hildon_pannable_area_get_vadjustment", vp, vp)(area.ptr)
+    get = lambda name: hl._fn("gtk", "gtk_adjustment_" + name, ctypes.c_double, vp)(adj)
+    top = max(0.0, get("get_upper") - get("get_page_size"))
+    hl._fn("gtk", "gtk_adjustment_set_value", None, vp, ctypes.c_double)(adj, min(top, max(0.0, get("get_value") + pixels)))
+    return get("get_page_size")
+
+
+def page_size(area):
+    vp = ctypes.c_void_p
+    adj = hl._fn("hil", "hildon_pannable_area_get_vadjustment", vp, vp)(area.ptr)
+    return hl._fn("gtk", "gtk_adjustment_get_page_size", ctypes.c_double, vp)(adj)
+
+
+def main():
+    try:                                   # errors and crashes of the program go to a log (a program started from the menu has no terminal)
+        log = open(os.path.join(F.DIR, "hildon.log"), "w", buffering=1)
+        sys.stderr = log
+        faulthandler.enable(log)
+    except OSError:
+        pass
+    if not hl.init():
+        sys.exit("no X display")
+    F.ensure_rc()
+    proc = []                              # the running sfeed_update (one at a time)
+    refreshers = []                        # functions that redraw the open lists after a change
+
+    win = hl.Window(_("Feeds"))
+    root = hl.VBox(spacing=6)
+    top = hl.HBox(spacing=6, homogeneous=True)
+    root.add(top)
+    store = hl.ListStore(2)
+    lv = hl.ListView(store)
+    area = hl.PannableArea()
+    area.add(lv)
+    root.add(area, expand=True)
+
+    # ---- the list of feeds ----
+    def reload_feeds():
+        store.clear()
+        cnt = F.counts()
+        store.append([ALL, _("%d new") % sum(u for u, _t in cnt.values())])
+        for name, _url in F.read_rc():
+            u, t = cnt.get(name, (0, 0))
+            store.append([name, (_("%d new / %d") % (u, t)) if t else _("not downloaded yet")])
+
+    def selected_feed():
+        row = lv.selected()
+        return row[0] if row else None
+
+    # ---- the text of an item ----
+    def open_article(items, index, after):
+        item = items[index]
+        F.mark_read([item["link"]])
+        w = hl.Window(item["title"][:40], on_destroy=lambda _w: after(), quit_on_close=False)
+        box = hl.VBox(spacing=4)
+        bar = hl.HBox(spacing=4, homogeneous=True)
+        box.add(bar)
+        pa = hl.PannableArea()
+        text = hl.Label(item["title"] + "\n\n" + F.article_text(item), wrap=True, xalign=0.0)
+        text.set_size_request(770, -1)                            # the width at which the text wraps
+        pa.add_viewport(text)
+        box.add(pa, expand=True)
+
+        def go(step):
+            j = index + step
+            if 0 <= j < len(items):
+                w.destroy()
+                open_article(items, j, after)
+            else:
+                hl.Banner(w, _("That was the last item") if step > 0 else _("That is the first item"))
+
+        def browser(url):
+            if not F.open_in_browser(url):
+                hl.Banner(w, _("The browser could not be started"))
+
+        bar.add(hl.Button(_("Previous"), on_clicked=lambda b: go(-1)), expand=True)
+        bar.add(hl.Button(_("Next"), on_clicked=lambda b: go(1)), expand=True)
+        bar.add(hl.Button(_("Page"), on_clicked=lambda b: browser("file://" + F.write_page(item))), expand=True)
+        bar.add(hl.Button(_("Original"), on_clicked=lambda b: browser(item["link"])), expand=True)
+
+        def key(keyval, state, hw):
+            if keyval == KEY_DOWN:
+                scroll(pa, 90)
+            elif keyval == KEY_UP:
+                scroll(pa, -90)
+            elif keyval in (KEY_PGDN, KEY_SPACE):
+                scroll(pa, page_size(pa) * 0.9)
+            elif keyval == KEY_PGUP:
+                scroll(pa, -page_size(pa) * 0.9)
+            elif keyval == KEY_RIGHT:
+                go(1)
+            elif keyval == KEY_LEFT:
+                go(-1)
+            else:
+                return False
+            return True
+        w.on_key(key)
+        w.add(box)
+        w.show()
+
+    # ---- the items of one feed (or of all unread) ----
+    def open_items(name):
+        w = hl.Window(name, quit_on_close=False)
+        box = hl.VBox(spacing=4)
+        bar = hl.HBox(spacing=4, homogeneous=True)
+        box.add(bar)
+        st = hl.ListStore(2)
+        v = hl.ListView(st)
+        pa = hl.PannableArea()
+        pa.add(v)
+        box.add(pa, expand=True)
+        items = []
+
+        def fill():
+            nonlocal items
+            seen = F.read_links()
+            items = F.unread_items() if name == ALL else F.load_items(name)
+            st.clear()
+            for it in items:
+                st.append([("• " if it["link"] not in seen else "   ") + it["title"], F.when(it["ts"]) + ("  ·  " + it["feed"] if name == ALL else "")])
+            reload_feeds()
+
+        def tapped(_w):
+            i = v._current                  # the row of the tap (hildonlite keeps it, see ListView._remember)
+            if i is not None and i < len(items):
+                open_article(list(items), i, fill)
+
+        def mark_all_here():
+            F.mark_read([i["link"] for i in items])
+            fill()
+        bar.add(hl.Button(_("Mark all read"), on_clicked=lambda b: mark_all_here()), expand=True)
+        v.connect("row-activated", tapped)
+        fill()
+        refreshers.append(fill)
+        w.connect("destroy", lambda _w: refreshers.remove(fill) if fill in refreshers else None)
+        w.add(box)
+        w.show()
+        return lambda i: open_article(list(items), i, fill)
+
+    lv.connect("row-activated", lambda _w: selected_feed() and open_items(selected_feed()))
+
+    # ---- fetching ----
+    def start_update():
+        if proc:
+            hl.Banner(win, _("An update is running already"))
+            return
+        proc.append(F.start_update())
+        tick()
+
+    def tick():
+        if proc and proc[0].poll() is not None:
+            code = proc.pop().returncode
+            hl.Banner(win, _("Feeds updated") if code == 0 else _("The update failed (code %d)") % code)
+            reload_feeds()
+            for f in list(refreshers):
+                f()
+        win.set_title(_("Feeds - updating...") if proc else _("Feeds"))
+        return True
+
+    # ---- adding, importing and removing ----
+    def add_feed():
+        d = hl.Dialog(_("Add a feed"), win)
+        e_name = hl.Entry("")
+        e_url = hl.Entry("https://")
+        d.body.add(hl.Label(_("Name"), xalign=0.0)); d.body.add(e_name)
+        d.body.add(hl.Label(_("Address of the RSS/Atom feed (https://...)"), xalign=0.0)); d.body.add(e_url)
+        d.add_button(_("Add"), hl.OK); d.add_button(_("Cancel"), hl.CANCEL)
+        d.show()
+        while True:
+            if d.run() != hl.OK:
+                d.destroy()
+                return
+            name, url = e_name.get_text().strip(), e_url.get_text().strip()
+            if not name or "\n" in name:
+                hl.Banner(win, _("Give the feed a name"))
+            elif not re.match(r"https?://\S+$", url):
+                hl.Banner(win, _("The address must start with http:// or https://"))
+            else:
+                try:
+                    F.add_feed(name, url)
+                    break
+                except ValueError as e:
+                    hl.Banner(win, str(e))
+            d.show()
+        d.destroy()
+        reload_feeds()
+        start_update()
+
+    def import_opml():
+        files = F.find_opml_files()
+        if not files:
+            hl.info(win, _("No OPML file found. Copy one (*.opml or *.xml) to the phone, for example into MyDocs."))
+            return
+        d = hl.Dialog(_("Import feeds from OPML"), win)
+        picker = hl.PickerButton(_("File"), [os.path.basename(f) for f in files], 0)
+        d.body.add(picker)
+        d.add_button(_("Import"), hl.OK); d.add_button(_("Cancel"), hl.CANCEL)
+        d.show()
+        r = d.run()
+        path = files[picker.get_active()]
+        d.destroy()
+        if r != hl.OK:
+            return
+        try:
+            added, skipped = F.import_opml(path)
+        except ValueError as e:
+            hl.info(win, str(e))
+            return
+        hl.Banner(win, _("%d feeds added, %d were there already") % (added, skipped))
+        reload_feeds()
+        if added:
+            start_update()
+
+    def remove_feed():
+        name = selected_feed()
+        if not name or name == ALL:
+            hl.Banner(win, _("Tap a feed first"))
+            return
+        if hl.confirm(win, _("Remove the feed %s and its downloaded items?") % name):
+            F.remove_feed(name)
+            reload_feeds()
+
+    def mark_all():
+        if hl.confirm(win, _("Mark every item of every feed as read?")):
+            F.mark_read([i["link"] for n, _u in F.read_rc() for i in F.load_items(n)])
+            reload_feeds()
+            for f in list(refreshers):
+                f()
+
+    top.add(hl.Button(_("Refresh"), on_clicked=lambda b: start_update()), expand=True)
+    top.add(hl.Button(_("Add feed"), on_clicked=lambda b: add_feed()), expand=True)
+    win.add(root)
+    menu = hl.AppMenu()
+    menu.add(_("Import feeds from OPML"), lambda b: import_opml())
+    menu.add(_("Remove the selected feed"), lambda b: remove_feed())
+    menu.add(_("Mark everything read"), lambda b: mark_all())
+    menu.add(_("Quit"), lambda b: hl.quit())
+    win.set_menu(menu)
+    reload_feeds()
+    tick()
+    hl.timeout(1500, tick)
+    win.show()
+    demo = os.environ.get("SFEEDHILDON_OPEN")                # self-test / screenshots: "feed name" or "feed name:item number"
+    if demo:
+        feed, _sep, num = demo.partition(":")
+        opener = open_items(feed)
+        if num:
+            opener(int(num))
+    if os.environ.get("SFEEDHILDON_TIMEOUT"):
+        hl.timeout(int(os.environ["SFEEDHILDON_TIMEOUT"]) * 1000, lambda: hl.quit() or False)
+    hl.main()
+
+
+if __name__ == "__main__":
+    main()
